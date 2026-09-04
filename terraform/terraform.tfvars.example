@@ -1,0 +1,11 @@
+# Copy to terraform.tfvars and fill in - terraform.tfvars is gitignored.
+
+db_host                 = "your-instance.xxxxxxxxxxxx.us-east-1.rds.amazonaws.com"
+db_name                 = "your_db"
+db_user                 = "a_read_only_monitoring_user"
+db_password_secret_arn  = "arn:aws:secretsmanager:us-east-1:123456789012:secret:pg-slot-sentinel-db-password-abc123"
+notification_email      = "you@example.com"
+
+# Required if the RDS instance is not publicly reachable (it should not be).
+# vpc_subnet_ids         = ["subnet-xxxxxxxx", "subnet-yyyyyyyy"]
+# vpc_security_group_ids = ["sg-xxxxxxxx"]
