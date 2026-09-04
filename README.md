@@ -1,61 +1,40 @@
 # pg-slot-sentinel
 
-A small monitor that catches a specific, nasty PostgreSQL/RDS failure mode
-before it becomes an emergency: a logical replication slot left behind by a
-consumer that no longer exists, quietly forcing the database to retain WAL
-until the volume fills up.
+A watchdog for a specific, easy-to-miss way Postgres runs out of disk:
+a logical replication slot nobody is reading from anymore, holding the
+server hostage to old WAL it will never get to delete.
 
-The scenario below walks through how this failure mode plays out in
-practice, and how it gets fixed - it's the real, well-documented way this
-happens, not a hypothetical.
+## Why this is worth watching for
 
-## The failure mode
+Postgres will keep a replication slot's starting point pinned forever if
+nothing ever advances it. That's the whole contract of a slot — it exists
+so a consumer can disconnect and reconnect later without losing its place.
+The trade-off is that Postgres can't tell the difference between "my
+consumer is on a coffee break" and "my consumer was decommissioned three
+months ago and nobody told me." Both look identical from the server's
+side: an idle slot, and WAL piling up behind it.
 
-**Symptom.** Free storage on an RDS Postgres instance had been declining
-for about a week, at a rate that didn't line up with normal traffic growth.
+This is a well-known trap with tools like AWS DMS in particular. Stopping
+or deleting a DMS replication task cleans up the task itself, but the
+logical slot it created on the source database is a separate object that
+has to be dropped on purpose. Skip that step and the slot just sits there,
+inactive, pinning WAL indefinitely — often for weeks before anyone
+notices free storage quietly draining away with no matching growth in
+actual table data.
 
-**The red herring.** A large one-off backfill job had been run against the
-same database a few days earlier, migrating a legacy table to a new schema.
-That was the obvious first suspect — it had touched millions of rows, it
-was recent, and "the backfill left something bloated behind" is a
-completely reasonable hypothesis. A day went into checking table and index
-bloat, confirming autovacuum was keeping up, and diffing table sizes
-before and after the backfill. None of it explained the gap.
+By the time it shows up as a storage alarm, the fix is usually simple
+(drop the slot, reclaim the space) but the diagnosis isn't, because
+nothing points you at replication slots specifically. Disk usage graphs
+just show a downward slope with no obvious cause.
 
-**Root cause.** Two DMS replication tasks, set up months earlier to feed a
-downstream reporting pipeline, had been stopped after that pipeline was
-decommissioned. Stopping a DMS task does not drop the logical replication
-slot it created on the source database. Postgres has no way to know the
-consumer is gone — from its point of view, the slot might resume reading
-at any moment, so it keeps every WAL segment since the slot's last
-confirmed position, indefinitely. The two slots had been sitting inactive
-for months, quietly forcing the server to retain roughly 1.8 TB of WAL
-that nothing would ever read.
+## What this repo actually does
 
-**Fix.** Confirm the DMS tasks were genuinely gone and not just paused,
-then drop the corresponding replication slots (`SELECT
-pg_drop_replication_slot('slot_name')`). That freed the retained WAL
-immediately — Postgres could finally recycle segments it had been forced
-to hold onto for months.
+`monitor/` is a small Lambda that periodically asks Postgres how much WAL
+each of its replication slots is pinning, flags any slot over a
+configurable size, and pages out through SNS before "slowly draining"
+turns into "out of storage."
 
-**The gap.** Nothing was watching for this. A slot's retained-WAL size is
-visible in `pg_replication_slots` and in RDS's own `OldestReplicationSlotLag`
-/ `TransactionLogsDiskUsage` CloudWatch metrics, but nobody had wired an
-alert to either — an inactive slot from a decommissioned pipeline looks
-identical to a healthy one that's just between runs unless you're actually
-watching how much WAL it's retaining.
-
-This repo is that missing alert, built so it can be dropped in front of any
-Postgres instance that uses logical replication slots — DMS-backed or
-otherwise.
-
-## How it decides what to alert on
-
-The obvious signal — "is this slot `active`?" — is not the right one.
-Slots legitimately sit inactive between runs for all sorts of healthy
-reasons. The signal that actually matters is **how much WAL a slot is
-forcing the server to retain**, regardless of whether it happens to be
-active at the exact moment you check:
+The detection query is intentionally not "is this slot active":
 
 ```sql
 SELECT slot_name, active,
@@ -63,18 +42,24 @@ SELECT slot_name, active,
 FROM pg_replication_slots;
 ```
 
-`monitor/handler.py` runs this query, flags any slot whose `retained_bytes`
-crosses a configurable threshold (`WAL_RETENTION_ALERT_BYTES`, default
-5 GiB), publishes a `ReplicationSlotRetainedBytes` CloudWatch metric per
-slot for graphing, and — if any slot is over threshold — publishes directly
-to an SNS topic (wire a PagerDuty integration, email, whatever, onto that
-topic).
+`active` tells you whether something is connected right now, which is a
+weak, noisy signal — plenty of perfectly healthy slots are idle between
+runs. `retained_bytes` tells you the thing that actually costs you disk
+space, independent of whether the slot happens to be connected at the
+instant you check. A slot can be `active = false` and completely fine, or
+`active = false` and quietly eating a terabyte. Only one of those needs a
+page.
 
-## Try it locally
+`monitor/handler.py` runs that query, splits slots into "under threshold"
+and "over threshold" (`WAL_RETENTION_ALERT_BYTES`, 5 GiB by default),
+writes a `ReplicationSlotRetainedBytes` metric per slot to CloudWatch for
+graphing, and publishes to an SNS topic when anything crosses the line —
+hang PagerDuty, email, whatever off that topic.
 
-The `demo/` directory reproduces the actual failure mode end to end against
-a real Postgres instance, using the exact monitor code above — not a
-reimplementation of it.
+## Proving it, not just describing it
+
+`demo/` spins up a real Postgres container and walks through the actual
+mechanics rather than asking you to take the README's word for it:
 
 ```bash
 cd demo
@@ -83,22 +68,20 @@ pip install -r requirements.txt
 python run_demo.py
 ```
 
-What it does:
+It creates one replication slot and generates traffic while it exists but
+nothing reads from it (a stand-in for a task that got stopped and
+forgotten), then creates a second slot afterward that starts out fully
+caught up (a stand-in for a consumer that's actually keeping up). It runs
+the real `monitor.handler.run()` — not a mock of it — against both, and
+asserts the first gets flagged and the second doesn't. Then it drops the
+orphaned slot and re-checks to confirm the retained WAL is actually gone,
+which is the real remediation step, not a simulated one.
 
-1. Creates `orphaned_dms_task_slot`, then writes 800 rows while it exists —
-   standing in for a DMS task that was running, then stopped.
-2. Creates `healthy_consumer_slot` *after* that traffic, representing a
-   consumer that's currently caught up.
-3. Runs `monitor.handler.run()` in dry-run mode and asserts it flags only
-   the orphaned slot.
-4. Drops the orphaned slot — the actual fix — and re-runs the monitor to
-   confirm the retained WAL is gone.
+If the monitor ever stops discriminating correctly between the two, this
+script fails loudly (`AssertionError`, non-zero exit), so it doubles as a
+regression check.
 
-It fails loudly (a Python `AssertionError`, non-zero exit code) if the
-monitor doesn't discriminate correctly, so it also works as an integration
-check, not just a demo.
-
-## Deploying for real
+## Shipping it
 
 ```bash
 ./scripts/build_lambda.sh          # packages monitor/ into build/monitor.zip
@@ -112,45 +95,48 @@ terraform apply \
   -var="notification_email=you@example.com"
 ```
 
-This provisions:
+That gives you:
 
-- The Lambda (packaged by `build_lambda.sh`, `psycopg2-binary` pinned to
-  Lambda's actual Linux runtime platform regardless of what OS you build
-  on — see the comment in that script for why that matters)
-- An EventBridge schedule (`rate(15 minutes)` by default)
-- An SNS topic for alerts, optionally with an email subscription
-- A least-privilege IAM role: `secretsmanager:GetSecretValue` scoped to
-  exactly the one secret, `cloudwatch:PutMetricData`, `sns:Publish` scoped
-  to exactly the one topic, plus VPC networking permissions only if you
-  pass subnet/security group IDs (RDS is almost always in a VPC; the
-  Lambda needs to be too, to reach it)
-- A CloudWatch alarm on the *monitor's own* Lambda errors — if the check
-  stops running, that's at least as important to know as a slot problem
+- The Lambda itself, with `psycopg2-binary`'s compiled extensions built
+  for Lambda's actual Linux runtime regardless of what machine you run
+  the build script on (see the comment in `build_lambda.sh` — building a
+  binary dependency on a Mac and shipping it to Lambda is a classic way
+  to get an unhelpful import error at runtime)
+- An EventBridge schedule running the check every 15 minutes by default
+- An SNS topic, optionally wired to an email subscription out of the box
+- IAM scoped tight: `secretsmanager:GetSecretValue` on exactly one
+  secret, `sns:Publish` on exactly one topic, `cloudwatch:PutMetricData`,
+  and VPC networking permissions only if you actually pass subnet/security
+  group IDs (which you should — RDS lives in a VPC, so the Lambda needs
+  to as well)
+- A CloudWatch alarm on the Lambda's own error count, because a monitor
+  that silently stops running is its own kind of outage
 
-`db_user` needs no special privileges beyond what's required to query
-`pg_replication_slots`, which is readable by any role by default.
+The database user only needs whatever privileges let it read
+`pg_replication_slots`, which is world-readable by default — no elevated
+access required.
 
-### A design decision worth calling out
+### One thing that's deliberately missing
 
-There's deliberately no CloudWatch alarm on the `ReplicationSlotRetainedBytes`
-metric itself. That metric carries a `SlotName` dimension, and CloudWatch
-alarms can't wildcard across dimension values — an alarm without a slot
-name fixed in advance would just never receive data and silently never
-fire, which is exactly the kind of gap this project exists to close, not
-recreate. The metric exists for graphing and ad hoc investigation; the
-Lambda alerts directly to SNS when it detects a problem, since that path
-has no such limitation.
+There's no CloudWatch alarm on `ReplicationSlotRetainedBytes` itself. That
+metric is published per-slot with a `SlotName` dimension, and CloudWatch
+alarms can't be defined to match "any value of this dimension" — an alarm
+without a specific slot name baked in would just sit there receiving no
+data and never trip, which would be exactly the kind of silent gap this
+project is trying to eliminate. The metric is there for dashboards and
+manual digging; the actual alert is the Lambda's direct SNS publish,
+which doesn't have that limitation.
 
-## Repository layout
+## Layout
 
 ```text
 pg-slot-sentinel/
 ├── monitor/
-│   ├── handler.py          # the Lambda / the actual logic
+│   ├── handler.py          # the check itself
 │   ├── requirements.txt
-│   └── tests/               # unit tests, mocked AWS + a fake DB cursor
+│   └── tests/               # mocked AWS calls + a fake DB cursor
 ├── terraform/                # Lambda, schedule, SNS, IAM, alarms
-├── demo/                     # docker-compose Postgres + reproduction script
+├── demo/                     # docker-compose Postgres + the reproduction script
 ├── scripts/build_lambda.sh   # packages monitor/ for Lambda
 └── .github/workflows/ci.yml  # pytest + terraform fmt/validate
 ```
