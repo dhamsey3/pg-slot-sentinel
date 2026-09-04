@@ -5,44 +5,45 @@ before it becomes an emergency: a logical replication slot left behind by a
 consumer that no longer exists, quietly forcing the database to retain WAL
 until the volume fills up.
 
-This exists because of a real incident. The details below are genericized —
-service names, numbers, and specifics have been changed or rounded — but the
-mechanism and the fix are exactly what happened.
+This exists because of a real incident. The account below is a generic
+composite, not a retelling of any specific one — but the mechanism and the
+fix are the real, well-documented way this failure happens.
 
 ## The incident
 
-**Symptom.** Free storage on an RDS Postgres instance was shrinking over
-several days with no corresponding growth in table data. Nothing in the
-application layer explained it.
+**Symptom.** Free storage on an RDS Postgres instance had been declining
+for about a week, at a rate that didn't line up with normal traffic growth.
 
-**The red herring.** Around the same time, an identity/auth service came
-under attack and, as a side effect, was writing an unusual volume of data
-into a downstream payments service. That looked like the obvious suspect —
-it was recent, it was alarming, and it was actively being paged on. A
-meaningful chunk of the initial investigation went into ruling it out before
-anyone looked elsewhere.
+**The red herring.** A large one-off backfill job had been run against the
+same database a few days earlier, migrating a legacy table to a new schema.
+That was the obvious first suspect — it had touched millions of rows, it
+was recent, and "the backfill left something bloated behind" is a
+completely reasonable hypothesis. A day went into checking table and index
+bloat, confirming autovacuum was keeping up, and diffing table sizes
+before and after the backfill. None of it explained the gap.
 
-**Root cause.** Three unrelated services had, separately, had their DMS
-replication tasks stopped weeks earlier as part of normal decommissioning
-work. Stopping a DMS task does not drop the logical replication slot it
-created on the source database. Postgres does not know the consumer is
-gone — as far as it's concerned, that slot might resume reading at any
-moment, so it keeps every WAL segment since the slot's last confirmed
-position. All other services had been cleanly migrated and their slots
-dropped along with everything else. These three were missed. Between them,
-they were holding onto more than 3 TB of WAL that would never be read
-again.
+**Root cause.** Two DMS replication tasks, set up months earlier to feed a
+downstream reporting pipeline, had been stopped after that pipeline was
+decommissioned. Stopping a DMS task does not drop the logical replication
+slot it created on the source database. Postgres has no way to know the
+consumer is gone — from its point of view, the slot might resume reading
+at any moment, so it keeps every WAL segment since the slot's last
+confirmed position, indefinitely. The two slots had been sitting inactive
+for months, quietly forcing the server to retain roughly 1.8 TB of WAL
+that nothing would ever read.
 
-**Fix.** Confirm each DMS task was genuinely stopped and would not resume,
+**Fix.** Confirm the DMS tasks were genuinely gone and not just paused,
 then drop the corresponding replication slots (`SELECT
-pg_drop_replication_slot('slot_name')`). Doing this for the three orphaned
-slots freed roughly 2.4 TB immediately — Postgres could finally recycle WAL
-segments it had been forced to keep for weeks.
+pg_drop_replication_slot('slot_name')`). That freed the retained WAL
+immediately — Postgres could finally recycle segments it had been forced
+to hold onto for months.
 
 **The gap.** Nothing was watching for this. A slot's retained-WAL size is
 visible in `pg_replication_slots` and in RDS's own `OldestReplicationSlotLag`
 / `TransactionLogsDiskUsage` CloudWatch metrics, but nobody had wired an
-alert to either. The failure was silent until it was a capacity emergency.
+alert to either — an inactive slot from a decommissioned pipeline looks
+identical to a healthy one that's just between runs unless you're actually
+watching how much WAL it's retaining.
 
 This repo is that missing alert, built so it can be dropped in front of any
 Postgres instance that uses logical replication slots — DMS-backed or
