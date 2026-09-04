@@ -5,11 +5,11 @@ before it becomes an emergency: a logical replication slot left behind by a
 consumer that no longer exists, quietly forcing the database to retain WAL
 until the volume fills up.
 
-This exists because of a real incident. The account below is a generic
-composite, not a retelling of any specific one — but the mechanism and the
-fix are the real, well-documented way this failure happens.
+The scenario below walks through how this failure mode plays out in
+practice, and how it gets fixed - it's the real, well-documented way this
+happens, not a hypothetical.
 
-## The incident
+## The failure mode
 
 **Symptom.** Free storage on an RDS Postgres instance had been declining
 for about a week, at a rate that didn't line up with normal traffic growth.
@@ -91,8 +91,8 @@ What it does:
    consumer that's currently caught up.
 3. Runs `monitor.handler.run()` in dry-run mode and asserts it flags only
    the orphaned slot.
-4. Drops the orphaned slot — the actual fix from the incident — and
-   re-runs the monitor to confirm the retained WAL is gone.
+4. Drops the orphaned slot — the actual fix — and re-runs the monitor to
+   confirm the retained WAL is gone.
 
 It fails loudly (a Python `AssertionError`, non-zero exit code) if the
 monitor doesn't discriminate correctly, so it also works as an integration
