@@ -56,6 +56,11 @@ writes a `ReplicationSlotRetainedBytes` metric per slot to CloudWatch for
 graphing, and publishes to an SNS topic when anything crosses the line —
 hang PagerDuty, email, whatever off that topic.
 
+A slot that pins no WAL at all, such as a physical slot whose standby
+hasn't connected yet or one Postgres has invalidated, has a NULL
+`restart_lsn`. The monitor counts it as retaining 0 bytes rather than
+letting one such slot fail the check for every other slot.
+
 ## Proving it, not just describing it
 
 `demo/` spins up a real Postgres container and walks through the actual
@@ -71,15 +76,16 @@ python run_demo.py
 It creates one replication slot and generates traffic while it exists but
 nothing reads from it (a stand-in for a task that got stopped and
 forgotten), then creates a second slot afterward that starts out fully
-caught up (a stand-in for a consumer that's actually keeping up). It runs
-the real `monitor.handler.run()` — not a mock of it — against both, and
-asserts the first gets flagged and the second doesn't. Then it drops the
+caught up (a stand-in for a consumer that's actually keeping up), plus a
+physical slot for a standby that hasn't connected yet. It runs the real
+`monitor.handler.check_replication_slots()` — not a mock of it — against
+all three, and asserts only the first gets flagged. Then it drops the
 orphaned slot and re-checks to confirm the retained WAL is actually gone,
 which is the real remediation step, not a simulated one.
 
-If the monitor ever stops discriminating correctly between the two, this
+If the monitor ever stops discriminating correctly between them, this
 script fails loudly (`AssertionError`, non-zero exit), so it doubles as a
-regression check.
+regression check. CI runs it against a real Postgres on every push.
 
 ## Shipping it
 
@@ -138,7 +144,7 @@ pg-slot-sentinel/
 ├── terraform/                # Lambda, schedule, SNS, IAM, alarms
 ├── demo/                     # docker-compose Postgres + the reproduction script
 ├── scripts/build_lambda.sh   # packages monitor/ for Lambda
-└── .github/workflows/ci.yml  # pytest + terraform fmt/validate
+└── .github/workflows/ci.yml  # flake8, pytest, the demo, terraform fmt/validate
 ```
 
 ## License
